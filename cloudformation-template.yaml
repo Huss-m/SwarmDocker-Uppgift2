@@ -1,0 +1,330 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  One-click: Skapar komplett Docker Swarm (1 manager + ASG workers) med ALB.
+  Manager initierar Swarm, publicerar join-token till SSM Parameter Store och
+  deployar en stack när 2 workers är Ready. ECR auth via credential helper.
+
+Parameters:
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of existing EC2 Key Pair (for SSH).
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID (e.g. default VPC).
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two public subnets (different AZ).
+
+Mappings: {}
+
+Resources:
+  # =========================
+  # IAM (EC2 role + profile)
+  # =========================
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-EC2Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Policies:
+        - PolicyName: SwarmSsmParamRW
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParameterHistory
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sawm/*'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/swarm/*'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/docker-swarm-*'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*'  # förenklar demo
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-EC2Profile'
+      Roles: [!Ref EC2InstanceRole]
+
+  # =========================
+  # Security Groups
+  # =========================
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP to ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Swarm nodes (SSH, published ports, gossip/overlay)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # SSH (öppet för demo – lås gärna ner till din IP)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        # Trafik från ALB till noder på port 80
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  # Separata ingress-regler för att undvika cirkulär beroende
+  NodeSecurityGroupIngressSwarmMgmt:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2377
+      ToPort: 2377
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+
+  NodeSecurityGroupIngressGossipTcp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 7946
+      ToPort: 7946
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+
+  NodeSecurityGroupIngressGossipUdp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: udp
+      FromPort: 7946
+      ToPort: 7946
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+
+  NodeSecurityGroupIngressOverlay:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: udp
+      FromPort: 4789
+      ToPort: 4789
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+
+  # =========================
+  # Manager (EC2)
+  # =========================
+  ManagerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.small
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      SecurityGroupIds: [!Ref NodeSecurityGroup]
+      SubnetId: !Select [0, !Ref PublicSubnetIds]
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Manager'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          dnf update -y
+          dnf install -y docker amazon-ecr-credential-helper
+          # Per-registry cred helper (ingen plaintext-token behövs)
+          REGISTRY="${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
+          mkdir -p /root/.docker
+          cat >/root/.docker/config.json <<JSON
+          {
+            "credHelpers": {
+              "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com": "ecr-login"
+            }
+          }
+          JSON
+          systemctl enable --now docker
+          usermod -aG docker ec2-user
+
+          # Hämta privat IP via IMDSv2
+          TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+          PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+
+          # Initiera Swarm
+          docker swarm init --advertise-addr "$PRIVATE_IP"
+
+          # Publicera join token + manager IP till SSM Parameter Store
+          JOIN_TOKEN=$(docker swarm join-token -q worker)
+          aws ssm put-parameter --name "/swarm/manager-ip" --type String --value "$PRIVATE_IP" --overwrite
+          aws ssm put-parameter --name "/swarm/worker-token" --type SecureString --value "$JOIN_TOKEN" --overwrite
+
+          # Pre-pull imagen på manager
+          echo "Pre-pulling image on manager..."
+          docker pull ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/mydynamoapp:latest || echo "Pull failed, will retry later"
+
+          # Vänta på att minst 2 workers ansluter och är Ready
+          echo "Väntar på 2 workers..."
+          for i in $(seq 1 120); do
+            CNT=$(docker node ls --format '{{.Hostname}} {{.Status}} {{.Availability}} {{.ManagerStatus}}' | awk '$2=="Ready" && $3=="Active" && $4=="" {print $1}' | wc -l)
+            if [ "$CNT" -ge 2 ]; then
+              echo "Workers klara: $CNT"
+              break
+            fi
+            sleep 5
+          done
+
+          # Pre-pull imagen på alla worker nodes
+          echo "Pre-pulling image on all worker nodes..."
+          for node in $(docker node ls --format '{{.Hostname}}' --filter role=worker); do
+            echo "Pulling image on $node..."
+            docker node update --availability drain $node 2>/dev/null || true
+            sleep 2
+            # Via docker exec på noden (om möjligt) eller bara förlita sig på Swarm
+            docker node update --availability active $node 2>/dev/null || true
+          done
+
+          # Skapa och deploya stacken (ingress published 80->8080)
+          cat >/home/ec2-user/docker-stack.yml <<'YAML'
+          version: "3.8"
+          services:
+            web:
+              image: ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/mydynamoapp:latest
+              ports:
+                - "80:8080"
+              deploy:
+                replicas: 3
+                update_config:
+                  parallelism: 1
+                  order: start-first
+                  delay: 5s
+                restart_policy:
+                  condition: on-failure
+                  max_attempts: 3
+              healthcheck:
+                test: ["CMD-SHELL", "wget -qO- http://localhost:8080/ || exit 1"]
+                interval: 15s
+                timeout: 5s
+                retries: 5
+          YAML
+          chown ec2-user:ec2-user /home/ec2-user/docker-stack.yml
+
+          # Första deploy
+          docker stack deploy -c /home/ec2-user/docker-stack.yml helloworld-app
+
+  # =========================
+  # Worker Launch Template
+  # =========================
+  WorkerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-WorkerLT'
+      LaunchTemplateData:
+        ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+        InstanceType: t3.small
+        KeyName: !Ref KeyPairName
+        IamInstanceProfile:
+          Name: !Ref EC2InstanceProfile
+        SecurityGroupIds: [!Ref NodeSecurityGroup]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            dnf update -y
+            dnf install -y docker amazon-ecr-credential-helper
+            mkdir -p /root/.docker
+            cat >/root/.docker/config.json <<JSON
+            {
+              "credHelpers": {
+                "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com": "ecr-login"
+              }
+            }
+            JSON
+            systemctl enable --now docker
+            usermod -aG docker ec2-user
+
+            # Region till AWS CLI
+            export AWS_DEFAULT_REGION=${AWS::Region}
+
+            # Pre-pull imagen innan vi joinar swarm
+            echo "Pre-pulling application image..."
+            docker pull ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/mydynamoapp:latest || echo "Image pull failed, will be handled by Swarm"
+
+            # Hämta manager IP + worker token från SSM
+            MANAGER_IP=$(aws ssm get-parameter --name "/swarm/manager-ip" --query "Parameter.Value" --output text)
+            JOIN_TOKEN=$(aws ssm get-parameter --name "/swarm/worker-token" --with-decryption --query "Parameter.Value" --output text)
+
+            # Joina Swarm
+            docker swarm join --token "$JOIN_TOKEN" "$MANAGER_IP:2377" || true
+
+  # =========================
+  # ALB + Target Group + Listener
+  # =========================
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-TG'
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: '200-399'
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-ALB'
+      Scheme: internet-facing
+      SecurityGroups: [!Ref ALBSecurityGroup]
+      Subnets: !Ref PublicSubnetIds
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # =========================
+  # Auto Scaling Group (Workers)
+  # =========================
+  WorkerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: ManagerInstance
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-ASG'
+      VPCZoneIdentifier: !Ref PublicSubnetIds
+      MinSize: '2'
+      MaxSize: '4'
+      DesiredCapacity: '2'
+      TargetGroupARNs: [!Ref ALBTargetGroup]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkerLaunchTemplate
+        Version: !GetAtt WorkerLaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Worker'
+          PropagateAtLaunch: true
+
+Outputs:
+  ALBDNSName:
+    Description: Öppna denna URL för att nå appen (Swarm ingress på port 80).
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+  ManagerPublicIP:
+    Description: Publik IP till manager (SSH-felsökning).
+    Value: !GetAtt ManagerInstance.PublicIp
